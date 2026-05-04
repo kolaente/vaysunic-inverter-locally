@@ -275,7 +275,7 @@ receive verify passcode response...
 
 This confirmed that the device can be used locally once it is on the same LAN.
 The packet framing/login details and the standard-status P0 read command have
-now been reverse engineered enough to query read-only datapoints.
+now been reverse engineered enough to request status data locally.
 
 ## LAN Protocol Findings
 
@@ -411,8 +411,9 @@ then the same P0 status shape:
 00 00 00 05 13 FF FF FF FF FF FF FF ...
 ```
 
-This means local read access works without an app account or cloud token. The
-remaining work is decoding the returned binary P0 datapoint values reliably.
+This means local status requests work without an app account or cloud token.
+The remaining work is decoding the returned binary P0 datapoint values
+reliably.
 
 A focused read-only subset currently used by `probe-vaysunic-lan.sh` is:
 
@@ -426,7 +427,37 @@ That produces this 7-byte bitmask:
 40 00 00 00 00 1F 3F
 ```
 
-The script now has a partial decoder for those datapoints:
+The script prints the echoed mask, selected datapoint IDs, payload length, and
+non-zero byte offsets. It intentionally does not decode the returned status
+payload yet, because live responses showed that the device does not return a
+compact list of only the requested datapoints.
+
+Live standard-status behavior observed so far:
+
+```text
+Status code byte:       13
+Echoed mask:            matches the requested mask
+Data bytes after mask:  206 bytes
+Focused mask payload:   all zeroes while idle
+All-mask payload:       only offsets +9 and +10 non-zero while idle
+Non-zero bytes:         +9 = 0x23, +10 = 0x28
+```
+
+The two non-zero bytes are a useful clue:
+
+```text
+0x2328 = 9000
+VMCx008 power factor = raw * 0.01 - 90
+9000 * 0.01 - 90 = 0.00
+```
+
+That is a plausible default power-factor value, so bytes `+9/+10` in the
+fixed 206-byte status payload are likely the raw `VMCx008` field. This suggests
+the fixed payload begins with writable/config fields, hidden fields, or padding
+before the larger read-only inverter/PV counters.
+
+The visible `VM_WIFI` datapoints that are most useful for the first read-only
+reader are:
 
 ```text
 54  VMx000    total generation, uint32, ratio 0.01
@@ -442,6 +473,11 @@ The script now has a partial decoder for those datapoints:
 11  VMP1x003  PV1 power, uint32, ratio 0.1
 12  VMP1x004  PV1 generation, uint32, ratio 0.01
 ```
+
+`./probe-vaysunic-lan.sh --map-status 192.168.178.79` can send one status mask
+per datapoint ID. Current evidence shows the device accepts those masks but
+still returns the same fixed 206-byte data area, so single-ID masks do not by
+themselves reveal field offsets.
 
 Extra frames seen immediately after login:
 
@@ -747,17 +783,18 @@ Whether JSON datapoint responses are available locally, or only binary P0 packet
 Whether the inverter requires cloud-derived DID/binding state before local reads
 Meaning of LAN command 00 62
 Exact subscribe/update-push behavior after login
-Exact binary field order and full datatype map for all datapoints
+Exact binary field order, hidden fields, padding, and full datatype map
 ```
 
 Likely next investigations:
 
 ```text
-1. Validate the focused standard-status decoder against live, plausible values.
-2. Decode the full datapoint payload against the VM_WIFI product config.
-3. Reverse engineer writable/control commands only after read-only access is stable.
-4. Turn the probe into a small local reader.
-5. Keep the inverter internet-blocked in the FRITZ!Box.
+1. Extract the full hidden product/datapoint layout from the native SDK inputs.
+2. Capture status while the inverter is producing non-zero PV/grid values.
+3. Decode the fixed 206-byte payload against the VM_WIFI product config.
+4. Reverse engineer writable/control commands only after read-only access is stable.
+5. Turn the probe into a small local reader.
+6. Keep the inverter internet-blocked in the FRITZ!Box.
 ```
 
 Potential capture command after the inverter is on LAN:

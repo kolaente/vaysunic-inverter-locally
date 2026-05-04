@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (late evening: bind state shown to be volatile; cloud is plaintext MQTT to a Tencent IP, local-broker emulation plan)
+Last updated: 2026-05-04 (late evening: MQTT topic + payload decoded; cloud channel carries the same P0 frame as LAN reads, every 3 minutes)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -968,74 +968,125 @@ cloudless reader we need to keep that flag fresh.
 
 ## Cloud-Side Findings
 
-Captured the inverter's WAN traffic via the FRITZ!Box's built-in
-packet capture (`http://fritz.box/html/capture.html`, per-client
-WLAN entry for `espressif`). Output is a `.eth` file that is just
-pcap. Captures placed under `captures/` (gitignored, in
-`/vaysunic-app` exclusion).
+Captured the inverter's WAN traffic via the FRITZ!Box built-in packet
+capture (`http://fritz.box/html/capture.html`, per-client WLAN entry
+for `espressif`). Output is a `.eth` file that is just pcap. Captures
+placed under `captures/` (gitignored).
 
-Key result from a short capture window: the **only** WAN traffic the
-inverter generates is a TCP connection to a single hardcoded IP:
+The inverter's entire WAN footprint is one long-lived TCP connection
+to a single hardcoded IP, on plaintext MQTT:
 
 ```text
 Inverter -> 119.29.42.117:1883 (TCP)
 ```
 
-`119.29.42.117` is in Tencent Cloud. Port `1883` is **plaintext MQTT**.
-No DNS lookups happen; the IP is cached/hardcoded in the device. There
-is no HTTPS, no TLS, no WebSocket - just plain MQTT.
+`119.29.42.117` is in Tencent Cloud. There are no DNS lookups (the IP
+is cached/hardcoded in the device), no HTTPS, no TLS, no WebSocket,
+no other destinations. Plain MQTT only.
 
-The capture was too short to show the full MQTT session (we only saw
-the TCP three-way handshake before internet was re-blocked). A longer
-capture is required to extract:
+### MQTT Cadence
 
 ```text
-- The CONNECT packet (client ID, username, password, will topic, keepalive)
-- SUBSCRIBE topics the device listens on (downstream commands)
-- PUBLISH topics + payloads the device emits (telemetry shape)
-- PINGREQ interval (the keep-alive cadence; this is the timer that the
-  "bound" cache is keyed off of)
-- Whether the broker sends any commands the device requires to stay happy
+TCP session:    one long-lived connection, source port 56226
+PINGREQ:        every ~50 s, 2-byte packet from inverter
+PINGRESP:       ~300 ms after each PINGREQ, server replies 2 bytes
+PUBLISH:        every ~180 s (3 minutes), inverter -> server, ~255 bytes
+Server -> dev:  PINGRESPs and TCP ACKs only. No SUBSCRIBE response,
+                no downstream PUBLISH, no commands.
 ```
 
-Raw 802.11 captures (`wlan-129...`) are encrypted Wi-Fi frames and not
+So MQTT keep-alive is 50 s, telemetry rate is one push every 3 minutes,
+and the broker is essentially a passive sink for our purposes.
+
+### MQTT Topic and Payload
+
+```text
+Topic:    dev2app/<DID>            (this device: dev2app/add8a1aB064yb50OdKfV1k)
+Payload:  the same Gizwits P0 status frame we get from a LAN read,
+          byte-for-byte (header, length, command, mask, 206-byte data)
+          except the status-code byte is 0x14 (vs 0x13 over LAN).
+```
+
+Decoded with the existing LAN reader's offset map, the first PUBLISH
+in the capture was:
+
+```text
+Grid:    228.0 V  /  50.00 Hz
+Output:  195 W
+Temp:    29.5 °C
+PV1:      32.3 V  /  3.1 A  =   99.2 W   (gen 8.22 kWh)
+PV2:      32.6 V  /  3.0 A  =   96.0 W   (gen 7.98 kWh)
+PV1+PV2 = 195.2 W  (matches Output)
+Total:   16.20 kWh lifetime
+Serial:  353800004548
+```
+
+So the MQTT path delivers the same telemetry as the LAN read. We do not
+need to keep the LAN bind state alive at all - the inverter pushes its
+own data on its own timer and we just need to be the broker that
+receives it.
+
+### Still Unknown
+
+```text
+The CONNECT packet content. The captures so far were taken mid-session,
+  with the TCP connection already established before the capture started,
+  so client ID / username / password / will / announced keepalive are not
+  visible. To see them, capture during a fresh session: power-cycle the
+  inverter, or close the existing TCP session at the network level, then
+  let it reconnect.
+Whether the broker authenticates. Most Gizwits stacks use productKey as
+  username and a derivation involving productSecret as password. With
+  Mosquitto running anonymous and accepting any CONNECT, the inverter
+  may or may not be happy depending on what return code it expects.
+Whether the device subscribes to a downstream topic (likely
+  app2dev/<DID>) and whether the broker normally publishes anything on
+  it that the device requires.
+```
+
+Raw 802.11 captures (`wlan-129...`) are encrypted Wi-Fi frames, not
 useful without the WPA key. Pick the per-client decoded entry on the
 FRITZ!Box capture page (labelled by hostname/MAC) instead.
 
 ## Local-Broker Emulation Plan
 
-Plaintext MQTT plus a single hardcoded broker IP makes this tractable.
-Plan once the longer capture has been analysed:
+Plaintext MQTT, single hardcoded IP, passive broker, `dev2app/<DID>`
+push every 3 minutes carrying the exact LAN P0 frame. Plan:
 
-1. Run a local MQTT broker (Mosquitto) on a LAN host (Pi, NAS,
-   always-on Linux box).
-2. Add `119.29.42.117/32` as a **secondary IP** on that host's network
-   interface so the host owns the broker's IP locally.
+1. Run Mosquitto on a LAN host (Pi, NAS, always-on Linux box).
+2. Add `119.29.42.117/32` as a **secondary IP** on that host's
+   interface so the host owns the broker IP locally.
 3. Add a **static route** on the FRITZ!Box (`Internet -> Freigaben /
-   Statische Routing-Tabelle`) saying `119.29.42.117/32` is reachable
-   via that LAN host.
-4. The inverter sends MQTT to `119.29.42.117:1883`, the FRITZ!Box
-   routes it to our LAN host, our host owns the IP, Mosquitto answers.
-   No DNAT needed.
-5. Configure Mosquitto to accept whatever auth the inverter uses
-   (extracted from the CONNECT packet), keep PINGREQ/PINGRESP alive,
-   and log/forward the published telemetry topics for our own use.
-6. Block the inverter's actual internet at the FRITZ!Box permanently
-   - the static route catches the broker IP, everything else is
-   blocked. No data leaves the LAN.
+   Statische Routing-Tabelle`): `119.29.42.117/32 via <LAN host>`.
+4. Inverter sends to `119.29.42.117:1883`, FRITZ!Box routes to our
+   LAN host, our host owns that IP, Mosquitto answers. No DNAT.
+5. Mosquitto config: accept (initially) anonymous CONNECT, log topics
+   and payloads. Subscribe to `dev2app/+/+` to capture all DIDs.
+6. Decoder: the existing `read-vaysunic.sh` Perl logic, applied to
+   the MQTT payload. Status byte is 0x14 instead of 0x13 - either
+   accept both or remove the strict marker check.
+7. Block the inverter's actual internet at the FRITZ!Box permanently.
+   The static route catches the broker IP, everything else is blocked.
+   No data leaves the LAN.
 
-Once that loop is closed, the LAN sensor read stays usable and we
-have a parallel telemetry feed straight from MQTT (the device's own
-push channel), which is probably more efficient than polling
-`./read-vaysunic.sh`.
+The MQTT path is independent of the volatile LAN-bind state. As long
+as the inverter has TCP reachability to the (faked) broker IP, it will
+publish telemetry every 3 minutes on its own. Once the broker is in
+place, `read-vaysunic.sh` becomes optional - useful for on-demand
+reads while the bind cache is still fresh, but no longer the primary
+data path.
 
 ## Open Items
 
 ```text
-The longer FRITZ!Box capture (3-5 minutes with internet allowed) to see
-  full MQTT handshake, auth, topic schema, keepalive interval.
-Whether the broker requires the device to receive specific control
-  messages to stay subscribed (firmware update offers, time sync, etc.).
+A capture of a fresh MQTT session (CONNECT included) to see client ID,
+  username, password, will, announced keepalive. Easiest trigger: power-
+  cycle the inverter while the FRITZ!Box capture is running.
+Whether the broker authenticates and what return codes the inverter
+  tolerates from CONNACK.
+Whether the device subscribes to a downstream topic (likely
+  app2dev/<DID>) and whether the broker normally publishes anything
+  on it that the device requires.
 Decoding of the writable/control area at offsets +0..+20 in the LAN
   status payload.
 Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188
@@ -1058,13 +1109,20 @@ read-vaysunic.sh          Human-readable LAN reader. Decodes the
 ## Engineering Next Steps
 
 ```text
-1. Capture full MQTT session (longer FRITZ!Box trace).
-2. Stand up Mosquitto with the right auth/topics on a LAN host.
-3. Add 119.29.42.117/32 secondary IP + FRITZ!Box static route.
-4. Verify the LAN read keeps working long-term (cron read-vaysunic.sh
-   every minute, alert on unbound-state revert).
-5. Optional: parse the MQTT PUBLISH telemetry directly so we have a
-   second, push-based data path independent of the LAN poll.
+1. Capture a fresh MQTT session (power-cycle the inverter during the
+   FRITZ!Box capture) to see the CONNECT packet and confirm auth.
+2. Stand up Mosquitto on a LAN host. Start with allow_anonymous,
+   subscribe to dev2app/+ and log everything. Tighten auth later if
+   the inverter requires specific credentials.
+3. Add 119.29.42.117/32 as a secondary IP on the broker host, add
+   the FRITZ!Box static route for 119.29.42.117/32 via that host.
+4. Decoder: reuse the read-vaysunic.sh decode logic against MQTT
+   payloads. Accept status-byte 0x14 (MQTT) and 0x13 (LAN read).
+5. Forward decoded values to wherever they need to go (Prometheus,
+   Home Assistant, MQTT topic of our own, plain log file).
+6. Long-running check: on-demand read-vaysunic.sh should also keep
+   working once the broker is in place, because the device's bind
+   cache stays fresh.
 ```
 
 Capture commands:

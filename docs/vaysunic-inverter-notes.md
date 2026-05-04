@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (afternoon: hardware verified producing, standard-status hypothesis disproved)
+Last updated: 2026-05-04 (evening: cloudless local sensor reads working end-to-end after one-time bind)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -459,32 +459,86 @@ Live standard-status behavior:
 Status code byte:       13
 Echoed mask:            matches the requested mask
 Data bytes after mask:  206 bytes
+```
+
+There are two distinct device states. They look the same on the wire (same
+command, same length, same mask) but produce very different payloads.
+
+**Unbound state** (factory-fresh, never associated with a Gizwits cloud
+account, even if the device has joined the user's Wi-Fi):
+
+```text
 Focused mask payload:   all zeroes (always)
 All-mask payload:       only offsets +9 and +10 non-zero (always)
 Non-zero bytes:         +9 = 0x23, +10 = 0x28 (= 0x2328 = 9000)
 ```
 
-The earlier hypothesis was that this is a native product-order payload, with
-writables at the start (the +9/+10 bytes matching `VMCx008` power-factor raw
-9000 → 0.00) and read-only sensor fields after them. **That hypothesis was
-disproved on 2026-05-04**: the payload is byte-identical whether the inverter
-is in standby (red status LED) or producing power normally (green status LED,
-grid-synced, panels delivering 38 V each). On a confirmed-producing unit there
-is no plausible scenario in which grid voltage, grid frequency, current power,
-PV1 voltage/current/power, lifetime generation, or running status are all
-literally zero. So bytes `+9/+10` are not "default power factor" - they are
-just a constant the device emits in this payload, and the rest of the 206 bytes
-is dead space (or meaningful in some way unrelated to live sensor values).
+We initially read this as evidence that bytes `+9/+10` were the
+`VMCx008` power-factor field with raw 9000 → 0.00, and that the rest of
+the payload was the rest of the writables and the read-only sensor area.
+That whole interpretation was wrong - the payload is byte-identical
+whether the inverter is in standby or actively producing. It is just a
+fixed pre-bind pattern with no live sensor content.
 
-A separate targeted probe earlier had shown that when requesting only mask bit
-index `6`, the response also contained non-zero bytes at `+0/+1` (`23 28`) -
-the same `0x2328` value. That looked like circumstantial support for the
-product-order hypothesis at the time, but in light of the disproof above it
-just confirms that the device echoes the same constant near the front of the
-payload when small masks are requested.
+**Bound state** (after a one-time bind via the official `com.vaysunic.app`
+to the Gizwits cloud, even after the inverter's internet is re-blocked at
+the FRITZ!Box):
 
-The bottom line is that the standard-status `0x90`/`0x93` LAN read does not
-carry sensor data on this device, regardless of which mask is sent.
+```text
+Focused / all-mask payloads carry live sensor values in product-order,
+big-endian, 4 bytes per uint32 datapoint, starting at offset +21.
+```
+
+Decoded with all the standard read-only `VMx000-VMx009` and PV string
+`VMP1x001-VMP8x004` datapoints, plus a tail block. Hex-dump excerpt of
+a producing unit (cloud blocked, mid-day):
+
+```text
++21-24   VMx001  grid voltage     uint32  ratio 0.1   ->  230.0 V
++25-28   VMx002  grid frequency   uint32  ratio 0.01  ->  50.04 Hz
++29-32   VMx003  current power    uint32  ratio 1     ->  345 W
++33-36   VMx004  temperature      uint32  ratio 0.1   ->  31.0 °C
++37-40   VMx005  rated power      uint32  ratio 1     ->  800 W
++41-44   VMx006  component count  uint32  ratio 1     ->  2
++45-48   VMx007  fault code 1     uint32              ->  0
++49-52   VMx008  fault code 2     uint32              ->  0
++53-56   VMx009  running status   uint32              ->  1
++57-60   VMP1x001 PV1 voltage     uint32  ratio 0.1   ->  32.7 V
++61-64   VMP1x002 PV1 current     uint32  ratio 0.1   ->  5.6 A
++65-68   VMP1x003 PV1 power       uint32  ratio 0.1   ->  179.2 W
++69-72   VMP1x004 PV1 generation  uint32  ratio 0.01  ->  8.18
++73-76   VMP2x001 PV2 voltage     uint32  ratio 0.1   ->  32.1 V
++77-80   VMP2x002 PV2 current     uint32  ratio 0.1   ->  5.2 A
++81-84   VMP2x003 PV2 power       uint32  ratio 0.1   ->  166.4 W
++85-88   VMP2x004 PV2 generation  uint32  ratio 0.01  ->  7.92
++89-180  VMP3..VMP8 (uint32 x 4 each)                 ->  0 (no PV3-8 connected)
++185-188 VMx000  total generation uint32  ratio 0.01  ->  16.10 kWh
++194-205 ASCII serial number ("353800004548")
+```
+
+PV1 + PV2 power = 179.2 + 166.4 = 345.6 W matches the `VMx003` total
+exactly. Successive reads return slightly different values, so the data
+is live and not cached.
+
+Notes on the layout:
+
+- Offsets `+0..+20` are still mostly zeros plus the `0x2328` constant at
+  `+9/+10`. Likely the writable/control datapoints (`VMCx*`) packed in
+  some smaller form, but we have not validated those individually yet.
+- Field decoding starts at `+21` and continues through `+88` for the
+  documented `VMx*` and `VMP1x* / VMP2x*` blocks. `VMP3x*..VMP8x*` are
+  reserved space, all zero on this 2-string unit.
+- `VMx000` (lifetime generation) is **not** at the start - it is at
+  `+185-188`, near the end of the variable-length area.
+- The trailing ASCII string at `+194-205` looks like the inverter's
+  internal serial/work-order number ("353800004548") and is consistent
+  across reads.
+
+The standard-status request mask appears to be irrelevant for sensor
+content: an all-`FF` mask and the focused mask both return the same
+underlying field positions filled with the same live values when the
+device is bound. The mask seems to function as a presence-of-block
+selector rather than a per-datapoint filter.
 
 The visible `VM_WIFI` datapoints that are most useful for the first read-only
 reader are:
@@ -878,57 +932,67 @@ Prefer a 2.4 GHz SSID. The app/SDK explicitly warns about 5 GHz during onboardin
 
 ## Where We Are
 
-The LAN control path is fully understood: UDP `12414` discovery, TCP `12416`
-login (`00 06` -> `00 07` -> `00 08` -> `00 09`), heartbeat (`00 15` -> `00 16`),
-and standard-status reads (`00 90 12 <mask>` -> `00 91 13 <mask> <206 bytes>`).
+The LAN path is fully working. UDP `12414` discovery, TCP `12416`
+login (`00 06` -> `00 07` -> `00 08` -> `00 09`), heartbeat (`00 15` ->
+`00 16`), and standard-status reads (`00 90 12 <mask>` -> `00 91 13 <mask>
+<206 bytes>`) deliver live sensor values once the device has been bound
+to the Gizwits cloud once via the official app. After the bind, the
+inverter's internet can be permanently re-blocked at the FRITZ!Box and
+the LAN reads continue to return current values across reconnects and
+power cycles.
 
-The sensor-read path is **not** the standard-status reads. Those reads return
-the same constant payload regardless of inverter run state. There is no other
-LAN command in the captured traffic.
+End-to-end verification on 2026-05-04:
 
-That leaves three possible homes for sensor data:
+1. Inverter freshly installed the previous evening, on FRITZ!Box LAN,
+   internet blocked. Standard-status payload was the static pre-bind
+   pattern (only `+9/+10 = 0x2328`), regardless of sun, grid sync, LED
+   state, or producing/standby state.
+2. Internet temporarily allowed for the inverter. `com.vaysunic.app`
+   installed, account created, device bound through the standard app
+   onboarding flow.
+3. While bound, `./probe-vaysunic-lan.sh` returned a fully populated
+   206-byte payload with live sensor values that matched physical
+   reality (230.0 V / 50.04 Hz mains, 31.0 °C, 800 W rated, 2 modules,
+   two PV strings around 32 V / 5.5 A).
+4. Internet re-blocked at the FRITZ!Box. Probe re-run. Sensor values
+   still present, slightly different from the previous read - confirming
+   live data, not a cached snapshot. PV1+PV2 power matched the AC output
+   field exactly.
 
-1. **Cloud only.** Device pushes telemetry to `api.gizwits.com` via HTTP /
-   WebSocket; app reads from cloud cache. LAN port 12416 is just for
-   control/management. Most likely, given the captured-traffic evidence.
-2. **Subscribe-gated.** A subscribe/bind step we have not performed unlocks
-   either `0x04` push frames or a different read variant. The Java SDK has
-   `GizWifiSDKSubscribeDevice`, but it is not visible as a LAN command in the
-   pcap.
-3. **An unidentified LAN command.** Possible but unlikely - the pcap shows
-   the app uses only the same five commands we know.
+Conclusion: bind once via the cloud, then run cloudless forever.
 
-## Decisive Next Test
-
-Do a one-time bind via the official app, then immediately re-run the probe
-while bound:
-
-1. Temporarily allow the inverter's internet at the FRITZ!Box.
-2. Install `com.vaysunic.app`, register an account, scan QR, accept binding.
-3. While the app is showing live values, run `./probe-vaysunic-lan.sh` again.
-4. Observe whether the LAN payload now contains non-zero sensor bytes.
-5. Re-block internet afterwards.
-
-Outcomes:
+## Open Items
 
 ```text
-LAN payload now populated  -> theory (2). Replicate whatever the bind sets,
-                              keep cloud blocked, win.
-LAN payload still all zero -> theory (1). Sensor data is cloud-only. Path
-                              forward is to mimic the cloud endpoint locally
-                              (DNS-redirect api.gizwits.com / euapi.gizwits.com /
-                              app.vaysunic.com to a small local server) and
-                              capture the device's telemetry uploads.
+Why the bind unlocks LAN sensor reads. The bind goes via the official app
+  to the cloud, but the resulting "device serves sensor data on LAN" state
+  is local to the device. Most likely the device caches a "this productKey
+  is a known/active cloud subscriber" flag and conditions the read response
+  on it. Worth confirming with another packet capture during a fresh bind,
+  but not required for the cloudless reader to work.
+Whether a bind ever expires when cloud has been unreachable for days/weeks.
+  If it does, we need to either keep the cloud reachable for the bind
+  channel (firewalled but allowed), or DNS-redirect api.gizwits.com to a
+  local stub that keeps the device "subscribed" without exfiltrating data.
+Decoding of the writable/control area at offsets +0..+20.
+Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188 and
+  the ASCII serial at +194-205).
+Meaning of LAN command 00 62 (still: mystery ack after verify).
 ```
 
-## Other Open Items
+## Engineering Next Steps
 
 ```text
-Meaning of LAN command 00 62 (mystery ack after verify)
-Whether the device speaks any datapoint protocol over the cloud HTTP/WS path
-  that we could intercept locally via DNS redirect
-Whether the captured-traffic finding ("only five LAN commands ever") generalises
-  beyond our own probe runs - the pcap is mostly our own probe sessions
+1. Update probe-vaysunic-lan.sh to decode the +21..+88 sensor block plus
+   VMx000 at +185-188 into named, scaled fields.
+2. Wrap the decoded read in a small daemon that exposes the values over
+   Prometheus / MQTT / a local HTTP endpoint, suitable for Home Assistant
+   or any other consumer.
+3. Add a long-running soak test (e.g. cron the probe every minute for a
+   week) to detect any bind-state expiry.
+4. Optional: capture a fresh bind session at the network level to identify
+   exactly what the cloud-side handshake does, so the bind itself can also
+   be done locally without ever letting the device reach the real cloud.
 ```
 
 Capture command for future PCAPs (the existing `vaysunic-app/vaysunic-lan.pcap`

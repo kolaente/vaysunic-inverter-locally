@@ -284,6 +284,29 @@ A local probe script exists in this repository:
 ```
 
 The script uses a Nix shell shebang and talks directly to TCP `12416`.
+It also sends a LAN discovery packet to UDP `12414` before opening the TCP
+session.
+
+Successful UDP discovery request:
+
+```text
+TX: 00 00 00 03 03 00 00 03
+Destination: 255.255.255.255:12414 and <device-ip>:12414
+```
+
+Successful UDP discovery response from `192.168.178.79:12414`:
+
+```text
+Command:     00 04
+DID:         add8a1aB064yb50OdKfV1k
+MAC:         48:CA:43:DD:F1:64
+Module:      04X3009R
+Product key: 81cd0c0164984978910ccd52892c4466
+Tail bytes include: api.gizwits.com:80, 4.1.4, 11116431
+```
+
+The product key in the discovery response matches the `VM_WIFI` product
+configuration from the app bundle.
 
 Gizwits LAN frames are TCP stream messages with this shape:
 
@@ -600,7 +623,7 @@ Based on app code and Gizwits SDK behavior, the likely flow is:
 2. SDK starts `libGizWifiDaemon.so`.
 3. Java client handshakes with the native daemon on localhost port `21027`.
 4. For SoftAP setup, Java also sends the simple UDP packet to the inverter AP on port `12414`.
-5. Native daemon handles LAN discovery and local login/passcode exchange.
+5. Native daemon handles LAN discovery with command `00 03` -> `00 04` on UDP `12414`.
 6. Direct local login on TCP `12416` works with commands `00 06` -> `00 07` and `00 08` -> `00 09`.
 7. Keepalive uses `00 15` -> `00 16`.
 8. Once a device is discovered/logged in, the app likely subscribes using product key/product secret and then receives datapoint updates.

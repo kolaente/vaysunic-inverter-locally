@@ -1,6 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
+Last updated: 2026-05-04
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -31,6 +32,55 @@ TCP scan against `10.10.100.254` found only one open TCP port:
 ```
 
 Ports checked and found closed included common HTTP/MQTT candidates such as `80`, `443`, `8080`, `1883`, and `8883`. A simple binary probe to TCP `12416` did not return a banner or obvious response.
+
+After SoftAP provisioning to the FRITZ!Box Wi-Fi, the inverter joined the LAN as:
+
+```text
+Hostname: espressif.fritz.box
+IP:       192.168.178.79
+MAC:      48:CA:43:DD:F1:64
+Vendor:   Espressif
+```
+
+The Espressif name is the Wi-Fi chip/module vendor name, not necessarily the inverter vendor.
+
+LAN reachability and scans:
+
+```text
+Ping: intermittent but reachable, TTL 255
+ARP:  48:CA:43:DD:F1:64 on 192.168.178.79
+```
+
+Focused TCP scan:
+
+```text
+23/tcp    closed telnet
+80/tcp    closed http
+443/tcp   closed https
+1883/tcp  closed mqtt
+8080/tcp  closed http-proxy
+8883/tcp  closed secure-mqtt
+12414/tcp closed unknown
+12416/tcp open   unknown
+21027/tcp closed unknown
+```
+
+Focused UDP scan:
+
+```text
+12414/udp open|filtered unknown
+12416/udp closed        unknown
+2415/udp  closed        codima-rtp
+67/udp    closed        dhcps
+68/udp    closed        dhcpc
+123/udp   closed        ntp
+5353/udp  closed        zeroconf
+5683/udp  closed        coap
+1883/udp  closed        ibm-mqisdp
+8883/udp  closed        secure-mqtt
+```
+
+There is no HTTP UI and no obvious MQTT listener. TCP `12416` is the important local Gizwits control socket.
 
 The QR code on the inverter/manual points to:
 
@@ -224,6 +274,78 @@ receive verify passcode response...
 ```
 
 This strongly suggests the device can be used locally once it is on the same LAN, but the packet framing/login details still need to be captured or reverse engineered.
+
+## LAN Protocol Findings
+
+A local probe script exists in this repository:
+
+```bash
+./probe-vaysunic-lan.sh 192.168.178.79
+```
+
+The script uses a Nix shell shebang and talks directly to TCP `12416`.
+
+Gizwits LAN frames are TCP stream messages with this shape:
+
+```text
+00 00 00 03
+LEN
+FLAG
+CMD_HI CMD_LO
+BODY...
+```
+
+`LEN` uses the same variable-length 7-bit encoding seen in `ProtocolBase#getLength`. It is the length of `FLAG + CMD + BODY`, not including the 4 byte header or the length field itself.
+
+Important implementation note: TCP reads can contain multiple Gizwits frames back-to-back. The probe must split frames using the Gizwits length field. A single `read(4096)` is not a message boundary.
+
+Successful local passcode/login sequence:
+
+```text
+Get passcode request:
+TX: 00 00 00 03 03 00 00 06
+
+Get passcode response:
+RX: 00 00 00 03 0F 00 00 07 00 0A 47 4E 59 56 4A 47 47 4E 54 4F
+
+Extracted passcode:
+GNYVJGGNTO
+
+Verify passcode request:
+TX: 00 00 00 03 0F 00 00 08 00 0A 47 4E 59 56 4A 47 47 4E 54 4F
+
+Verify passcode response:
+RX: 00 00 00 03 04 00 00 09 00
+
+Heartbeat request:
+TX: 00 00 00 03 03 00 00 15
+
+Heartbeat response:
+RX: 00 00 00 03 03 00 00 16
+```
+
+Observed short status/query attempts:
+
+```text
+Query 0x90:
+TX: 00 00 00 03 04 00 00 90 02
+RX: 00 00 00 03 03 00 00 91
+
+Query 0x93:
+TX: 00 00 00 03 08 00 00 93 00 00 00 04 02
+RX: 00 00 00 03 07 00 00 94 00 00 00 04
+```
+
+Those prove the local protocol is alive, but they do not yet produce inverter datapoint values. The likely missing piece is a subscribe/status setup command or a more precise P0 query sequence.
+
+Extra frames seen immediately after login:
+
+```text
+00 09 ack, repeated
+00 62 ack/status
+```
+
+Meaning of `00 62` is not decoded yet.
 
 ## SoftAP Provisioning
 
@@ -479,9 +601,11 @@ Based on app code and Gizwits SDK behavior, the likely flow is:
 3. Java client handshakes with the native daemon on localhost port `21027`.
 4. For SoftAP setup, Java also sends the simple UDP packet to the inverter AP on port `12414`.
 5. Native daemon handles LAN discovery and local login/passcode exchange.
-6. Once a device is discovered, the app subscribes using product key/product secret and then receives datapoint updates.
-7. Device reads use `getDeviceStatus`.
-8. Device writes use `write` or `sendCmd`.
+6. Direct local login on TCP `12416` works with commands `00 06` -> `00 07` and `00 08` -> `00 09`.
+7. Keepalive uses `00 15` -> `00 16`.
+8. Once a device is discovered/logged in, the app likely subscribes using product key/product secret and then receives datapoint updates.
+9. Device reads use `getDeviceStatus` or P0 commands.
+10. Device writes use `write` or `sendCmd`.
 
 The app's own device list logic expects a cloud account token for `getBoundDevices`, but the native SDK has local discovery strings and functions. That is the opening for a cloudless LAN reader.
 
@@ -513,23 +637,22 @@ Known unknowns:
 
 ```text
 LAN discovery packet format
-Whether discovery uses UDP 2415, UDP 12414, TCP 12416, or a combination
-How passcode retrieval works
-How passcode verification works
+Whether discovery uses UDP 12414 plus TCP 12416, or another broadcast/multicast path
 How product secret is applied to LAN subscribe/control
 Whether status payloads are JSON datapoints, binary P0 packets, or both
 Whether the inverter requires cloud-derived DID/binding state before local reads
+Meaning of LAN command 00 62
+Exact subscribe/status command needed before datapoints are emitted
 ```
 
 Likely next investigations:
 
 ```text
-1. Provision inverter to FRITZ!Box Wi-Fi with internet blocked.
-2. Scan LAN for the inverter IP and open ports.
-3. Capture traffic while the official app or a minimal SDK stub talks to the device.
-4. Reverse engineer the LAN subscribe/status messages.
-5. Implement a small local reader.
-6. Map received datapoints using the product config above.
+1. Reverse engineer the LAN subscribe/status messages.
+2. Implement the missing subscribe/status command in probe-vaysunic-lan.sh.
+3. Decode the first datapoint payload against the VM_WIFI product config.
+4. Turn the probe into a small local reader.
+5. Keep the inverter internet-blocked in the FRITZ!Box.
 ```
 
 Potential capture command after the inverter is on LAN:
@@ -552,4 +675,3 @@ AVM FRITZ!Box internet blocking docs:
 ```text
 https://fritz.com/en/apps/knowledge-base/FRITZ-Box-7490/8_8_Restricting-internet-use-with-the-FRITZ-Box-parental-controls
 ```
-

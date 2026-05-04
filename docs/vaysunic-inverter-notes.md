@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (evening: cloudless local sensor reads working end-to-end after one-time bind)
+Last updated: 2026-05-04 (late evening: bind state shown to be volatile; cloud is plaintext MQTT to a Tencent IP, local-broker emulation plan)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -932,73 +932,148 @@ Prefer a 2.4 GHz SSID. The app/SDK explicitly warns about 5 GHz during onboardin
 
 ## Where We Are
 
-The LAN path is fully working. UDP `12414` discovery, TCP `12416`
-login (`00 06` -> `00 07` -> `00 08` -> `00 09`), heartbeat (`00 15` ->
-`00 16`), and standard-status reads (`00 90 12 <mask>` -> `00 91 13 <mask>
-<206 bytes>`) deliver live sensor values once the device has been bound
-to the Gizwits cloud once via the official app. After the bind, the
-inverter's internet can be permanently re-blocked at the FRITZ!Box and
-the LAN reads continue to return current values across reconnects and
-power cycles.
+The LAN path works **conditionally**. Once the inverter has been bound
+to the Gizwits cloud via the official `com.vaysunic.app`, the standard
+status read (`00 90 12 <mask>` -> `00 91 13 <mask> <206 bytes>`) returns
+live sensor values via the layout decoded above. While that "bound"
+state is active, internet can be blocked at the FRITZ!Box and reads
+keep working.
 
-End-to-end verification on 2026-05-04:
+**The bound state is not permanent.** End-to-end observation on
+2026-05-04:
 
-1. Inverter freshly installed the previous evening, on FRITZ!Box LAN,
-   internet blocked. Standard-status payload was the static pre-bind
-   pattern (only `+9/+10 = 0x2328`), regardless of sun, grid sync, LED
-   state, or producing/standby state.
-2. Internet temporarily allowed for the inverter. `com.vaysunic.app`
-   installed, account created, device bound through the standard app
-   onboarding flow.
-3. While bound, `./probe-vaysunic-lan.sh` returned a fully populated
-   206-byte payload with live sensor values that matched physical
-   reality (230.0 V / 50.04 Hz mains, 31.0 °C, 800 W rated, 2 modules,
-   two PV strings around 32 V / 5.5 A).
-4. Internet re-blocked at the FRITZ!Box. Probe re-run. Sensor values
-   still present, slightly different from the previous read - confirming
-   live data, not a cached snapshot. PV1+PV2 power matched the AC output
-   field exactly.
+1. Inverter freshly installed the previous evening. FRITZ!Box internet
+   blocked. Standard-status payload was the static pre-bind pattern
+   (only `+9/+10 = 0x2328`), regardless of sun, grid sync, LED state,
+   or producing/standby state.
+2. Internet temporarily allowed. App installed, account created,
+   device bound through the standard onboarding flow.
+3. While bound and producing, `./probe-vaysunic-lan.sh` returned a
+   fully populated payload matching physical reality (230.0 V /
+   50.04 Hz mains, 31.0 °C, 800 W rated, 2 modules, two PV strings
+   around 32 V / 5.5 A, AC output equal to PV1+PV2).
+4. Internet re-blocked at the FRITZ!Box. Probe re-run shortly after:
+   sensor values still present, slightly different from the previous
+   read - confirming live data.
+5. Roughly 30 minutes later (cloud still blocked, no other state
+   change), probe re-run again: payload **back to the static pre-bind
+   pattern**. Reader script's empty-payload detection caught it cleanly.
+6. Internet allowed again, brief delay, full payload populates again
+   without re-running the app.
 
-Conclusion: bind once via the cloud, then run cloudless forever.
+So the device caches a "I have an active cloud subscriber" flag,
+conditions the LAN read response on it, and the cache expires within
+tens of minutes once the cloud channel is silent. To get a permanent
+cloudless reader we need to keep that flag fresh.
+
+## Cloud-Side Findings
+
+Captured the inverter's WAN traffic via the FRITZ!Box's built-in
+packet capture (`http://fritz.box/html/capture.html`, per-client
+WLAN entry for `espressif`). Output is a `.eth` file that is just
+pcap. Captures placed under `captures/` (gitignored, in
+`/vaysunic-app` exclusion).
+
+Key result from a short capture window: the **only** WAN traffic the
+inverter generates is a TCP connection to a single hardcoded IP:
+
+```text
+Inverter -> 119.29.42.117:1883 (TCP)
+```
+
+`119.29.42.117` is in Tencent Cloud. Port `1883` is **plaintext MQTT**.
+No DNS lookups happen; the IP is cached/hardcoded in the device. There
+is no HTTPS, no TLS, no WebSocket - just plain MQTT.
+
+The capture was too short to show the full MQTT session (we only saw
+the TCP three-way handshake before internet was re-blocked). A longer
+capture is required to extract:
+
+```text
+- The CONNECT packet (client ID, username, password, will topic, keepalive)
+- SUBSCRIBE topics the device listens on (downstream commands)
+- PUBLISH topics + payloads the device emits (telemetry shape)
+- PINGREQ interval (the keep-alive cadence; this is the timer that the
+  "bound" cache is keyed off of)
+- Whether the broker sends any commands the device requires to stay happy
+```
+
+Raw 802.11 captures (`wlan-129...`) are encrypted Wi-Fi frames and not
+useful without the WPA key. Pick the per-client decoded entry on the
+FRITZ!Box capture page (labelled by hostname/MAC) instead.
+
+## Local-Broker Emulation Plan
+
+Plaintext MQTT plus a single hardcoded broker IP makes this tractable.
+Plan once the longer capture has been analysed:
+
+1. Run a local MQTT broker (Mosquitto) on a LAN host (Pi, NAS,
+   always-on Linux box).
+2. Add `119.29.42.117/32` as a **secondary IP** on that host's network
+   interface so the host owns the broker's IP locally.
+3. Add a **static route** on the FRITZ!Box (`Internet -> Freigaben /
+   Statische Routing-Tabelle`) saying `119.29.42.117/32` is reachable
+   via that LAN host.
+4. The inverter sends MQTT to `119.29.42.117:1883`, the FRITZ!Box
+   routes it to our LAN host, our host owns the IP, Mosquitto answers.
+   No DNAT needed.
+5. Configure Mosquitto to accept whatever auth the inverter uses
+   (extracted from the CONNECT packet), keep PINGREQ/PINGRESP alive,
+   and log/forward the published telemetry topics for our own use.
+6. Block the inverter's actual internet at the FRITZ!Box permanently
+   - the static route catches the broker IP, everything else is
+   blocked. No data leaves the LAN.
+
+Once that loop is closed, the LAN sensor read stays usable and we
+have a parallel telemetry feed straight from MQTT (the device's own
+push channel), which is probably more efficient than polling
+`./read-vaysunic.sh`.
 
 ## Open Items
 
 ```text
-Why the bind unlocks LAN sensor reads. The bind goes via the official app
-  to the cloud, but the resulting "device serves sensor data on LAN" state
-  is local to the device. Most likely the device caches a "this productKey
-  is a known/active cloud subscriber" flag and conditions the read response
-  on it. Worth confirming with another packet capture during a fresh bind,
-  but not required for the cloudless reader to work.
-Whether a bind ever expires when cloud has been unreachable for days/weeks.
-  If it does, we need to either keep the cloud reachable for the bind
-  channel (firewalled but allowed), or DNS-redirect api.gizwits.com to a
-  local stub that keeps the device "subscribed" without exfiltrating data.
-Decoding of the writable/control area at offsets +0..+20.
-Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188 and
-  the ASCII serial at +194-205).
+The longer FRITZ!Box capture (3-5 minutes with internet allowed) to see
+  full MQTT handshake, auth, topic schema, keepalive interval.
+Whether the broker requires the device to receive specific control
+  messages to stay subscribed (firmware update offers, time sync, etc.).
+Decoding of the writable/control area at offsets +0..+20 in the LAN
+  status payload.
+Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188
+  and the ASCII serial at +194-205).
 Meaning of LAN command 00 62 (still: mystery ack after verify).
+```
+
+## Tools In This Repo
+
+```text
+provision-vaysunic.sh     One-time SoftAP -> FRITZ!Box Wi-Fi onboarding.
+probe-vaysunic-lan.sh     Raw LAN protocol explorer; prints framing,
+                          login, status payloads, non-zero offsets.
+read-vaysunic.sh          Human-readable LAN reader. Decodes the
+                          standard-status payload into named fields
+                          (grid V/Hz, output W, temp, total kWh, per-PV
+                          V/I/P/gen). Detects unbound state.
 ```
 
 ## Engineering Next Steps
 
 ```text
-1. Update probe-vaysunic-lan.sh to decode the +21..+88 sensor block plus
-   VMx000 at +185-188 into named, scaled fields.
-2. Wrap the decoded read in a small daemon that exposes the values over
-   Prometheus / MQTT / a local HTTP endpoint, suitable for Home Assistant
-   or any other consumer.
-3. Add a long-running soak test (e.g. cron the probe every minute for a
-   week) to detect any bind-state expiry.
-4. Optional: capture a fresh bind session at the network level to identify
-   exactly what the cloud-side handshake does, so the bind itself can also
-   be done locally without ever letting the device reach the real cloud.
+1. Capture full MQTT session (longer FRITZ!Box trace).
+2. Stand up Mosquitto with the right auth/topics on a LAN host.
+3. Add 119.29.42.117/32 secondary IP + FRITZ!Box static route.
+4. Verify the LAN read keeps working long-term (cron read-vaysunic.sh
+   every minute, alert on unbound-state revert).
+5. Optional: parse the MQTT PUBLISH telemetry directly so we have a
+   second, push-based data path independent of the LAN poll.
 ```
 
-Capture command for future PCAPs (the existing `vaysunic-app/vaysunic-lan.pcap`
-was made similarly):
+Capture commands:
 
 ```bash
+# FRITZ!Box (preferred): http://fritz.box/html/capture.html, pick the
+# per-client WLAN entry for the inverter, save the .eth file (it is pcap).
+
+# Local LAN observation only (does not see the WAN side):
 sudo nix-shell -p tcpdump --run 'tcpdump -i any -n -s0 -w /tmp/vaysunic-lan.pcap host <INVERTER_IP> or udp port 2415 or udp port 12414 or tcp port 12416'
 ```
 
@@ -1021,4 +1096,11 @@ Official VaySunic VM-P2 series German installation manual:
 
 ```text
 https://res.vaysunic.com/docs/DE/Installationsanleitung/VM-P2%20Serie_VaySunic_Schnellinstallationsanleitung_DE_V3.0.pdf
+```
+
+FRITZ!Box built-in packet capture (use the per-client WLAN entry for
+the inverter; output is a `.eth` file in pcap format):
+
+```text
+http://fritz.box/html/capture.html
 ```

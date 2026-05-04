@@ -452,9 +452,36 @@ VMCx008 power factor = raw * 0.01 - 90
 ```
 
 That is a plausible default power-factor value, so bytes `+9/+10` in the
-fixed 206-byte status payload are likely the raw `VMCx008` field. This suggests
-the fixed payload begins with writable/config fields, hidden fields, or padding
-before the larger read-only inverter/PV counters.
+206-byte status payload are likely the raw `VMCx008` field.
+
+A follow-up targeted probe strengthened this interpretation. When requesting
+only mask bit/index `6`, the response contained:
+
+```text
+Requested mask:  00 00 00 00 00 00 40
+Echoed mask:     00 00 00 00 00 00 40
+Non-zero bytes:  +0 = 0x23, +1 = 0x28, +9 = 0x23, +10 = 0x28
+```
+
+This suggests the standard-status bitmask is not keyed directly by the visible
+datapoint `id` values from the React Native `autoFeatureList`. It appears to be
+keyed by the native SDK's product-order index. In a plausible compact layout
+that starts with writable/config fields, the offsets line up exactly:
+
+```text
++0  VMCx001/VMCx002 bool bits, packed into one byte
++1  VMCx004 grid standard, uint16
++3  VMCx005 power limit percent, uint16
++5  VMCx006 absolute power limit, uint16
++7  VMCx007 current power increment, uint16
++9  VMCx008 power factor, uint16 raw 9000 -> 0.00
+```
+
+The exact response shape still needs care: the device returns 206 bytes after
+the mask even for single-bit reads, and a selected field can appear at the front
+of the returned data while the same value also appears at its likely full-layout
+offset. The safe current conclusion is that the payload is native product-order
+data, not simple datapoint-ID order.
 
 The visible `VM_WIFI` datapoints that are most useful for the first read-only
 reader are:
@@ -475,9 +502,9 @@ reader are:
 ```
 
 `./probe-vaysunic-lan.sh --map-status 192.168.178.79` can send one status mask
-per datapoint ID. Current evidence shows the device accepts those masks but
-still returns the same fixed 206-byte data area, so single-ID masks do not by
-themselves reveal field offsets.
+per locally-known schema entry. Current evidence shows the device accepts those
+masks but still returns a 206-byte data area, so single-entry masks are useful
+for clues but do not by themselves prove the full field layout.
 
 Extra frames seen immediately after login:
 
@@ -783,7 +810,7 @@ Whether JSON datapoint responses are available locally, or only binary P0 packet
 Whether the inverter requires cloud-derived DID/binding state before local reads
 Meaning of LAN command 00 62
 Exact subscribe/update-push behavior after login
-Exact binary field order, hidden fields, padding, and full datatype map
+Exact native product-order field list, hidden fields, padding, and full datatype map
 ```
 
 Likely next investigations:
@@ -792,9 +819,10 @@ Likely next investigations:
 1. Extract the full hidden product/datapoint layout from the native SDK inputs.
 2. Capture status while the inverter is producing non-zero PV/grid values.
 3. Decode the fixed 206-byte payload against the VM_WIFI product config.
-4. Reverse engineer writable/control commands only after read-only access is stable.
-5. Turn the probe into a small local reader.
-6. Keep the inverter internet-blocked in the FRITZ!Box.
+4. Rename/fix the probe's status-mask language once the product-order mapping is confirmed.
+5. Reverse engineer writable/control commands only after read-only access is stable.
+6. Turn the probe into a small local reader.
+7. Keep the inverter internet-blocked in the FRITZ!Box.
 ```
 
 Potential capture command after the inverter is on LAN:

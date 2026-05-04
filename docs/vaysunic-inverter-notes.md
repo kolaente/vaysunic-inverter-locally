@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (night: MQTT CONNECT auth decoded; broker is configured with the device-specific user; same secret as LAN passcode)
+Last updated: 2026-05-04 (night: end-to-end working - inverter publishing P0 telemetry to our local broker every ~3 min, internet blocked, no cloud)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -1002,9 +1002,19 @@ and the broker is essentially a passive sink for our purposes.
 
 ```text
 Topic:    dev2app/<DID>            (this device: dev2app/add8a1aB064yb50OdKfV1k)
-Payload:  the same Gizwits P0 status frame we get from a LAN read,
-          byte-for-byte (header, length, command, mask, 206-byte data)
-          except the status-code byte is 0x14 (vs 0x13 over LAN).
+Payload:  Gizwits-framed (header 0x00000003, varint length, flag 0x00,
+          cmd 0x0091, then a status byte that selects the payload type):
+
+          status 0x14 -> P0 telemetry frame, 7-byte mask FF*7 + 206-byte
+                         data area in the same product-order layout as
+                         the LAN read (see "LAN Protocol Findings"). One
+                         frame every ~180 s.
+
+          status 0x06 -> ASCII log dump from the Wi-Fi module
+                         (timestamps, MODULE INFO, gizProtocolResendData
+                         warnings, NTP attempts, etc.). Burst-uploaded
+                         when the device successfully reconnects to a
+                         broker after a long outage. Otherwise rare.
 ```
 
 Decoded with the existing LAN reader's offset map, the first PUBLISH
@@ -1144,9 +1154,11 @@ listeners = [{
 }];
 ```
 
-The inverter authenticates anonymously; the listener-level ACL
-restricts anonymous to writing `dev2app/#` and reading `app2dev/#`,
-nothing else. Existing users (`zigbee`, `homeassistant`, `telegraf`,
+The inverter authenticates as the explicit `add8a1aB064yb50OdKfV1k`
+user with the device's own LAN passcode as the MQTT password (see
+"CONNECT Auth" above). The listener-level anonymous ACL is left in
+place as a defense-in-depth fallback for any future Gizwits device
+on this broker. Existing users (`zigbee`, `homeassistant`, `telegraf`,
 `plug`, `valetudo`) keep their per-user ACLs.
 
 ### FRITZ!Box Configuration (manual)
@@ -1173,33 +1185,65 @@ ss -tnlp | grep 1883                            # mosquitto listening
 journalctl -u mosquitto -f                      # watch for new client
 ```
 
-Inverter connects from `192.168.178.79:56226` (or another ephemeral
-port if the device has rebooted), and PUBLISH messages on
-`dev2app/add8a1aB064yb50OdKfV1k` arrive every ~180 s.
+Successful connection log line:
 
-The MQTT path is independent of the LAN bind cache. As long as the
-inverter can reach the NAS-hosted `119.29.42.117:1883`, telemetry
-flows. The standard-status LAN read (`./read-vaysunic.sh`) keeps
-working as a side effect - the device's "I have a current cloud
-subscriber" cache stays fresh while the broker session is alive.
+```text
+New client connected from 192.168.178.79:NNNNN as add8a1aB064yb50OdKfV1k
+  (p1, c1, k120, u'add8a1aB064yb50OdKfV1k').
+```
+
+Subscribe to the topic to see live messages (use a different client
+ID via -i, otherwise Mosquitto kicks the inverter off):
+
+```bash
+nix-shell -p mosquitto --run "mosquitto_sub \
+  -h localhost -i monitor \
+  -u add8a1aB064yb50OdKfV1k -P GNYVJGGNTO \
+  -t 'dev2app/add8a1aB064yb50OdKfV1k' \
+  -F '%I %t %x'"
+```
+
+Confirmed end-to-end on 2026-05-04 night:
+
+- Internet for the inverter is blocked at the FRITZ!Box.
+- Mosquitto on the NAS receives PUBLISH frames (status byte 0x14)
+  every ~180 s on `dev2app/<DID>`. Decoded values match physical
+  reality (Grid V/Hz, output W, temp, per-PV V/I/P, lifetime kWh).
+- Right after the broker first accepted the inverter's CONNECT, the
+  device flushed a backlog of buffered debug logs (status byte 0x06,
+  ASCII text) - useful for diagnostics, otherwise infrequent.
+- The standard-status LAN read (`./read-vaysunic.sh`) keeps working
+  as a side effect: the device's "I have a current cloud subscriber"
+  cache stays fresh as long as the broker session is alive.
 
 ## Open Items
 
 ```text
-A capture of a fresh MQTT session (CONNECT included) to confirm the
-  inverter's actual auth credentials. Not blocking anymore - anonymous
-  CONNACK is accepted - but useful if we ever want to tighten the
-  listener-level ACL beyond anonymous.
 Decoding of the writable/control area at offsets +0..+20 in the P0
-  status payload (LAN read and MQTT PUBLISH share the same shape).
+  telemetry payload (action 0x13/0x14).
 Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188
   and the ASCII serial at +194-205).
 Meaning of LAN command 00 62 (mystery ack after verify).
 Whether the inverter ever subscribes to app2dev/<DID> and whether
-  anything we send on it can change writable datapoints (PF, power
-  limit, on/off). The listener-level ACL already permits anonymous
-  reads on app2dev/#, so the inverter can pick up anything we publish
-  there - we just have not tested it.
+  anything we publish there can change writable datapoints (PF, power
+  limit, on/off). Permitted by ACL, untested.
+What other action codes besides 0x06/0x13/0x14 the device emits over
+  MQTT - log frames also use cmd 0x0091, distinguished only by the
+  status byte.
+```
+
+### Hardware Internals (incidental finding from 0x06 log frames)
+
+```text
+Wi-Fi module SoC: Espressif ESP32-C3 (string "0ESP32C3" in log)
+Wi-Fi firmware:   04X3009R (matches UDP discovery module field)
+Reconnect policy: after ~5 min of broker disconnect, the module reboots
+                  itself ("5 min disconnect, try to reboot module")
+NTP:              the module attempts WIFI_NTP sync. With internet
+                  blocked it will fail; this does not affect telemetry.
+Health logs:      gizProtocolResendData warnings, AC-disconnect events,
+                  and module-info dumps are buffered locally and flushed
+                  whenever a fresh broker session establishes.
 ```
 
 ## Tools In This Repo

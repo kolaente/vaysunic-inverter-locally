@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (late evening: MQTT topic + payload decoded; cloud channel carries the same P0 frame as LAN reads, every 3 minutes)
+Last updated: 2026-05-04 (night: local Mosquitto broker deployed on the NAS; inverter is publishing telemetry to it via the impersonated cloud IP)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -1048,50 +1048,113 @@ Raw 802.11 captures (`wlan-129...`) are encrypted Wi-Fi frames, not
 useful without the WPA key. Pick the per-client decoded entry on the
 FRITZ!Box capture page (labelled by hostname/MAC) instead.
 
-## Local-Broker Emulation Plan
+## Local Broker - Deployed
 
-Plaintext MQTT, single hardcoded IP, passive broker, `dev2app/<DID>`
-push every 3 minutes carrying the exact LAN P0 frame. Plan:
+The inverter now publishes its telemetry to a Mosquitto broker running
+on the household NAS. No data leaves the LAN.
 
-1. Run Mosquitto on a LAN host (Pi, NAS, always-on Linux box).
-2. Add `119.29.42.117/32` as a **secondary IP** on that host's
-   interface so the host owns the broker IP locally.
-3. Add a **static route** on the FRITZ!Box (`Internet -> Freigaben /
-   Statische Routing-Tabelle`): `119.29.42.117/32 via <LAN host>`.
-4. Inverter sends to `119.29.42.117:1883`, FRITZ!Box routes to our
-   LAN host, our host owns that IP, Mosquitto answers. No DNAT.
-5. Mosquitto config: accept (initially) anonymous CONNECT, log topics
-   and payloads. Subscribe to `dev2app/+/+` to capture all DIDs.
-6. Decoder: the existing `read-vaysunic.sh` Perl logic, applied to
-   the MQTT payload. Status byte is 0x14 instead of 0x13 - either
-   accept both or remove the strict marker check.
-7. Block the inverter's actual internet at the FRITZ!Box permanently.
-   The static route catches the broker IP, everything else is blocked.
-   No data leaves the LAN.
+### Topology
 
-The MQTT path is independent of the volatile LAN-bind state. As long
-as the inverter has TCP reachability to the (faked) broker IP, it will
-publish telemetry every 3 minutes on its own. Once the broker is in
-place, `read-vaysunic.sh` becomes optional - useful for on-demand
-reads while the bind cache is still fresh, but no longer the primary
-data path.
+```text
+Inverter (192.168.178.79)
+    |
+    | TCP 1883 to 119.29.42.117 (the inverter's hardcoded "cloud" IP)
+    v
+FRITZ!Box
+    | Static IPv4 route: 119.29.42.117/32 via <NAS LAN IP>
+    v
+NAS (br0 has 119.29.42.117/32 as a secondary IP)
+    |
+    v
+Mosquitto :1883 - anonymous CONNECT accepted, dev2app/<DID> writable
+                  by anonymous, app2dev/<DID> readable by anonymous
+```
+
+The inverter cannot tell the difference between Mosquitto on the NAS
+and the real Tencent broker - it sees TCP RST/RA only if the route is
+missing, otherwise a working MQTT session.
+
+### NAS Configuration (Nix)
+
+`nas/machine/networking.nix` - secondary IP alias:
+
+```nix
+networking.interfaces.br0.ipv4.addresses = [
+  { address = "119.29.42.117"; prefixLength = 32; }
+];
+```
+
+`nas/monitoring/mqtt.nix` - listener tweaks (existing port-1883
+listener, all other users untouched):
+
+```nix
+listeners = [{
+  port = 1883;
+  settings.allow_anonymous = true;
+  acl = [
+    "topic write dev2app/#"
+    "topic read app2dev/#"
+  ];
+  users = { ... unchanged ... };
+}];
+```
+
+The inverter authenticates anonymously; the listener-level ACL
+restricts anonymous to writing `dev2app/#` and reading `app2dev/#`,
+nothing else. Existing users (`zigbee`, `homeassistant`, `telegraf`,
+`plug`, `valetudo`) keep their per-user ACLs.
+
+### FRITZ!Box Configuration (manual)
+
+Two GUI changes on the FRITZ!Box:
+
+1. *Heimnetz -> Heimnetzuebersicht -> Netzwerkeinstellungen ->
+   IPv4-Routen -> Neue IPv4-Route* (Erweiterte Ansicht must be on):
+   - IPv4-Netzwerk: `119.29.42.117`
+   - Subnetzmaske: `255.255.255.255`
+   - Gateway: NAS LAN IP
+   - IPv4-Route aktiv: yes
+2. *Internet -> Filter -> Kindersicherung*: block the inverter
+   (`192.168.178.79`). Local LAN traffic, including to the
+   NAS-hosted `119.29.42.117`, keeps working; only WAN is blocked.
+
+### Verification
+
+After `nixos-rebuild switch`:
+
+```bash
+ip addr show dev br0 | grep 119.29.42.117       # alias up
+ss -tnlp | grep 1883                            # mosquitto listening
+journalctl -u mosquitto -f                      # watch for new client
+```
+
+Inverter connects from `192.168.178.79:56226` (or another ephemeral
+port if the device has rebooted), and PUBLISH messages on
+`dev2app/add8a1aB064yb50OdKfV1k` arrive every ~180 s.
+
+The MQTT path is independent of the LAN bind cache. As long as the
+inverter can reach the NAS-hosted `119.29.42.117:1883`, telemetry
+flows. The standard-status LAN read (`./read-vaysunic.sh`) keeps
+working as a side effect - the device's "I have a current cloud
+subscriber" cache stays fresh while the broker session is alive.
 
 ## Open Items
 
 ```text
-A capture of a fresh MQTT session (CONNECT included) to see client ID,
-  username, password, will, announced keepalive. Easiest trigger: power-
-  cycle the inverter while the FRITZ!Box capture is running.
-Whether the broker authenticates and what return codes the inverter
-  tolerates from CONNACK.
-Whether the device subscribes to a downstream topic (likely
-  app2dev/<DID>) and whether the broker normally publishes anything
-  on it that the device requires.
-Decoding of the writable/control area at offsets +0..+20 in the LAN
-  status payload.
+A capture of a fresh MQTT session (CONNECT included) to confirm the
+  inverter's actual auth credentials. Not blocking anymore - anonymous
+  CONNACK is accepted - but useful if we ever want to tighten the
+  listener-level ACL beyond anonymous.
+Decoding of the writable/control area at offsets +0..+20 in the P0
+  status payload (LAN read and MQTT PUBLISH share the same shape).
 Decoding of the trailing block (+181 onwards beyond VMx000 at +185-188
   and the ASCII serial at +194-205).
-Meaning of LAN command 00 62 (still: mystery ack after verify).
+Meaning of LAN command 00 62 (mystery ack after verify).
+Whether the inverter ever subscribes to app2dev/<DID> and whether
+  anything we send on it can change writable datapoints (PF, power
+  limit, on/off). The listener-level ACL already permits anonymous
+  reads on app2dev/#, so the inverter can pick up anything we publish
+  there - we just have not tested it.
 ```
 
 ## Tools In This Repo
@@ -1109,20 +1172,20 @@ read-vaysunic.sh          Human-readable LAN reader. Decodes the
 ## Engineering Next Steps
 
 ```text
-1. Capture a fresh MQTT session (power-cycle the inverter during the
-   FRITZ!Box capture) to see the CONNECT packet and confirm auth.
-2. Stand up Mosquitto on a LAN host. Start with allow_anonymous,
-   subscribe to dev2app/+ and log everything. Tighten auth later if
-   the inverter requires specific credentials.
-3. Add 119.29.42.117/32 as a secondary IP on the broker host, add
-   the FRITZ!Box static route for 119.29.42.117/32 via that host.
-4. Decoder: reuse the read-vaysunic.sh decode logic against MQTT
-   payloads. Accept status-byte 0x14 (MQTT) and 0x13 (LAN read).
-5. Forward decoded values to wherever they need to go (Prometheus,
-   Home Assistant, MQTT topic of our own, plain log file).
-6. Long-running check: on-demand read-vaysunic.sh should also keep
-   working once the broker is in place, because the device's bind
-   cache stays fresh.
+1. MQTT subscriber + decoder: small daemon (Python or a Mosquitto
+   client + Perl) that subscribes to dev2app/# on the NAS broker,
+   decodes the P0 frame the same way read-vaysunic.sh does, and
+   exposes named values (Home Assistant via MQTT auto-discovery,
+   Prometheus textfile, or just appended to a log).
+2. Long-running soak: confirm the inverter stays connected through
+   the night, brownouts, and FRITZ!Box reboots. Currently believed
+   stable but not yet observed for >hours.
+3. Optional cleanup: capture a fresh CONNECT, decide whether to
+   replace the anonymous + listener-ACL with a dedicated user.
+4. Optional control: experiment with publishing on app2dev/<DID>
+   to see what the inverter accepts (PF, power limit, on/off). Do
+   this read-only first - log the device's reaction before sending
+   anything that could change physical behaviour.
 ```
 
 Capture commands:

@@ -273,7 +273,9 @@ send verify passcode to deviceFd %d success
 receive verify passcode response...
 ```
 
-This strongly suggests the device can be used locally once it is on the same LAN, but the packet framing/login details still need to be captured or reverse engineered.
+This confirmed that the device can be used locally once it is on the same LAN.
+The packet framing/login details and the standard-status P0 read command have
+now been reverse engineered enough to query read-only datapoints.
 
 ## LAN Protocol Findings
 
@@ -347,7 +349,7 @@ Heartbeat response:
 RX: 00 00 00 03 03 00 00 16
 ```
 
-Observed short status/query attempts:
+Observed custom P0 status/query attempts:
 
 ```text
 Query 0x90:
@@ -359,7 +361,87 @@ TX: 00 00 00 03 08 00 00 93 00 00 00 04 02
 RX: 00 00 00 03 07 00 00 94 00 00 00 04
 ```
 
-Those prove the local protocol is alive, but they do not yet produce inverter datapoint values. The likely missing piece is a subscribe/status setup command or a more precise P0 query sequence.
+Those prove the local protocol is alive, but they do not produce inverter datapoint values on this device.
+
+The important breakthrough came from disassembling `GizWifiSDKEncodeGetStatus` in
+`libGizWifiDaemon.so`. The SDK has two status encodings:
+
+```text
+custom/non-standard P0 query without internal SN:
+02
+
+standard P0 query without internal SN:
+12 <status bitmask>
+
+standard P0 query with internal SN:
+53 <4-byte SN> 00 <2-byte bitmask length> <status bitmask>
+```
+
+The `VM_WIFI` product config has datapoint IDs up to `54`, so the status bitmask
+is `ceil((54 + 1) / 8) = 7` bytes. The SDK maps datapoint IDs into the bitmask
+like this:
+
+```text
+byte_index = (mask_len - 1) - int(datapoint_id / 8)
+bit        = 1 << (datapoint_id & 7)
+```
+
+An all-standard-status request through LAN command `00 90`:
+
+```text
+TX: 00 00 00 03 0B 00 00 90 12 FF FF FF FF FF FF FF
+```
+
+returns a `00 91` frame containing a P0 status payload:
+
+```text
+13 FF FF FF FF FF FF FF ...
+```
+
+An all-standard-status request through LAN command `00 93`:
+
+```text
+TX: 00 00 00 03 0F 00 00 93 00 00 00 05 12 FF FF FF FF FF FF FF
+```
+
+returns a `00 94` frame. Its body starts with the 4-byte wrapper serial number,
+then the same P0 status shape:
+
+```text
+00 00 00 05 13 FF FF FF FF FF FF FF ...
+```
+
+This means local read access works without an app account or cloud token. The
+remaining work is decoding the returned binary P0 datapoint values reliably.
+
+A focused read-only subset currently used by `probe-vaysunic-lan.sh` is:
+
+```text
+54,0,1,2,3,4,5,8,9,10,11,12
+```
+
+That produces this 7-byte bitmask:
+
+```text
+40 00 00 00 00 1F 3F
+```
+
+The script now has a partial decoder for those datapoints:
+
+```text
+54  VMx000    total generation, uint32, ratio 0.01
+0   VMx001    grid voltage, uint32, ratio 0.1
+1   VMx002    grid frequency, uint32, ratio 0.01
+2   VMx003    current power, uint32, ratio 1
+3   VMx004    temperature, uint32, ratio 0.1
+4   VMx005    rated power, uint32, ratio 1
+5   VMx006    component count, uint32, ratio 1
+8   VMx009    running status, uint32, ratio 1
+9   VMP1x001  PV1 voltage, uint32, ratio 0.1
+10  VMP1x002  PV1 current, uint32, ratio 0.1
+11  VMP1x003  PV1 power, uint32, ratio 0.1
+12  VMP1x004  PV1 generation, uint32, ratio 0.01
+```
 
 Extra frames seen immediately after login:
 
@@ -654,26 +736,26 @@ Prefer a 2.4 GHz SSID. The app/SDK explicitly warns about 5 GHz during onboardin
 
 ## Remaining Unknowns
 
-The remaining hard part is the local LAN protocol between our computer and the inverter once it is on the FRITZ!Box Wi-Fi.
+The main read-only LAN path is now understood: UDP `12414` discovery, TCP
+`12416` login, then binary P0 standard-status reads.
 
 Known unknowns:
 
 ```text
-LAN discovery packet format
-Whether discovery uses UDP 12414 plus TCP 12416, or another broadcast/multicast path
 How product secret is applied to LAN subscribe/control
-Whether status payloads are JSON datapoints, binary P0 packets, or both
+Whether JSON datapoint responses are available locally, or only binary P0 packets
 Whether the inverter requires cloud-derived DID/binding state before local reads
 Meaning of LAN command 00 62
-Exact subscribe/status command needed before datapoints are emitted
+Exact subscribe/update-push behavior after login
+Exact binary field order and full datatype map for all datapoints
 ```
 
 Likely next investigations:
 
 ```text
-1. Reverse engineer the LAN subscribe/status messages.
-2. Implement the missing subscribe/status command in probe-vaysunic-lan.sh.
-3. Decode the first datapoint payload against the VM_WIFI product config.
+1. Validate the focused standard-status decoder against live, plausible values.
+2. Decode the full datapoint payload against the VM_WIFI product config.
+3. Reverse engineer writable/control commands only after read-only access is stable.
 4. Turn the probe into a small local reader.
 5. Keep the inverter internet-blocked in the FRITZ!Box.
 ```

@@ -149,10 +149,11 @@ in
         CapabilityBoundingSet = [ "" ];
         AmbientCapabilities = [ "" ];
 
-        # Allow appending to a single log file under /var/log if requested
-        ReadWritePaths = lib.mkIf (cfg.logFramesFile != null)
-          [ (builtins.dirOf (toString cfg.logFramesFile)) ];
-        StateDirectory = lib.mkIf (cfg.logFramesFile != null) [ "vaysunic-bridge" ];
+        # Auto-create /var/log/vaysunic-bridge with the right perms when
+        # the logFramesFile option is set under /var/log/. systemd grants
+        # the unit read-write access to LogsDirectory paths even with
+        # ProtectSystem=strict.
+        LogsDirectory = lib.mkIf (cfg.logFramesFile != null) "vaysunic-bridge";
       };
     };
   };

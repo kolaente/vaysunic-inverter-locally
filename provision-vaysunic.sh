@@ -97,8 +97,7 @@ send_softap_packets() {
   perl <<'PERL'
 use strict;
 use warnings;
-use IO::Socket::INET;
-use Socket qw(sockaddr_in inet_aton);
+use Socket qw(AF_INET SOCK_DGRAM SOL_SOCKET SO_BROADCAST sockaddr_in inet_aton);
 use Time::HiRes qw(sleep);
 
 my $ssid = $ENV{WIFI_SSID} // "";
@@ -122,11 +121,12 @@ my $packet = pack("C*", 0, 0, 0, 3, ($ssid_len + $password_len + 7) & 0xff, 0, 0
   . pack("C*", 0, $password_len)
   . $password;
 
-my $sock = IO::Socket::INET->new(
-  Proto     => "udp",
-  LocalPort => $source_port,
-  Broadcast => 1,
-) or die "could not open UDP socket on source port $source_port: $!\n";
+socket(my $sock, AF_INET, SOCK_DGRAM, 0)
+  or die "could not open UDP socket: $!\n";
+setsockopt($sock, SOL_SOCKET, SO_BROADCAST, pack("i", 1))
+  or die "could not enable UDP broadcast: $!\n";
+bind($sock, sockaddr_in($source_port, inet_aton("0.0.0.0")))
+  or die "could not bind UDP source port $source_port: $!\n";
 
 my $deadline = time() + $send_seconds;
 my $count = 0;
@@ -134,9 +134,9 @@ print "Sending SoftAP provisioning packet to 255.255.255.255:$udp_port";
 print " and $device_ip:$udp_port for $send_seconds seconds...\n";
 
 while (time() < $deadline) {
-  $sock->send($packet, 0, sockaddr_in($udp_port, inet_aton("255.255.255.255")))
+  defined(send($sock, $packet, 0, sockaddr_in($udp_port, inet_aton("255.255.255.255"))))
     or die "failed to send broadcast packet: $!\n";
-  $sock->send($packet, 0, sockaddr_in($udp_port, inet_aton($device_ip)))
+  defined(send($sock, $packet, 0, sockaddr_in($udp_port, inet_aton($device_ip))))
     or die "failed to send unicast packet: $!\n";
   $count++;
   print "sent batch $count\n";

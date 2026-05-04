@@ -1,7 +1,7 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04 (night: local Mosquitto broker deployed on the NAS; inverter is publishing telemetry to it via the impersonated cloud IP)
+Last updated: 2026-05-04 (night: MQTT CONNECT auth decoded; broker is configured with the device-specific user; same secret as LAN passcode)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
 
@@ -1026,22 +1026,50 @@ need to keep the LAN bind state alive at all - the inverter pushes its
 own data on its own timer and we just need to be the broker that
 receives it.
 
+### CONNECT Auth (decoded)
+
+Once the local broker was up, the inverter started reconnecting every
+~10 s and Mosquitto rejected each attempt with `disconnected, not
+authorised`. A `tcpdump` on the NAS during the retry loop captured the
+74-byte CONNECT payload:
+
+```text
+10 48                       MQTT CONNECT, remaining length 72
+00 06 4d 51 49 73 64 70     Protocol name "MQIsdp"
+03                          Protocol level 3 (MQTT 3.1)
+c2                          Connect flags: username + password + clean session
+00 78                       Keepalive: 120 seconds
+00 16 add8a1aB064yb50OdKfV1k  Client ID = DID (22 chars)
+00 16 add8a1aB064yb50OdKfV1k  Username  = DID (22 chars)
+00 0a GNYVJGGNTO              Password  = "GNYVJGGNTO" (10 chars)
+```
+
+So the inverter authenticates with **username = DID** and
+**password = the same 10-char passcode the LAN protocol returns via
+command `00 06`**. The same secret is used for both LAN and cloud
+auth, and is recoverable from the device itself over LAN, so it
+ranges between "device-specific" and "not really a secret" depending
+on how you look at it.
+
+No will message, clean session, 120 s keepalive announced (matches
+the observed 50 s PINGREQ cadence, which is well inside the 120 s
+window with margin).
+
+Mosquitto's `allow_anonymous = true` only kicks in when CONNECT has
+no username; once the inverter sends one, Mosquitto switches into
+authenticated mode and looks the user up in the user list. We added
+that user explicitly (see "Local Broker - Deployed").
+
 ### Still Unknown
 
 ```text
-The CONNECT packet content. The captures so far were taken mid-session,
-  with the TCP connection already established before the capture started,
-  so client ID / username / password / will / announced keepalive are not
-  visible. To see them, capture during a fresh session: power-cycle the
-  inverter, or close the existing TCP session at the network level, then
-  let it reconnect.
-Whether the broker authenticates. Most Gizwits stacks use productKey as
-  username and a derivation involving productSecret as password. With
-  Mosquitto running anonymous and accepting any CONNECT, the inverter
-  may or may not be happy depending on what return code it expects.
 Whether the device subscribes to a downstream topic (likely
   app2dev/<DID>) and whether the broker normally publishes anything on
-  it that the device requires.
+  it that the device requires. Worth a packet capture once the broker
+  accepts the auth - we should see SUBSCRIBE frames after CONNACK.
+Whether the password is the live LAN passcode (refreshed on every
+  cmd 00 06 response) or whether it was baked in at provisioning time
+  and is stable for the device lifetime. So far observed stable.
 ```
 
 Raw 802.11 captures (`wlan-129...`) are encrypted Wi-Fi frames, not
@@ -1066,8 +1094,9 @@ FRITZ!Box
 NAS (br0 has 119.29.42.117/32 as a secondary IP)
     |
     v
-Mosquitto :1883 - anonymous CONNECT accepted, dev2app/<DID> writable
-                  by anonymous, app2dev/<DID> readable by anonymous
+Mosquitto :1883 - dedicated user for the inverter (username = DID,
+                  password = device's LAN passcode), ACL scoped to
+                  dev2app/<DID>/# and app2dev/<DID>/#
 ```
 
 The inverter cannot tell the difference between Mosquitto on the NAS
@@ -1085,17 +1114,33 @@ networking.interfaces.br0.ipv4.addresses = [
 ```
 
 `nas/monitoring/mqtt.nix` - listener tweaks (existing port-1883
-listener, all other users untouched):
+listener, existing users untouched, one new user added for the
+inverter):
 
 ```nix
 listeners = [{
   port = 1883;
+
+  # Anonymous fallback (defense in depth - any future Gizwits device
+  # that connects without auth could publish to dev2app/# but nothing
+  # else). Currently unused: our inverter authenticates explicitly.
   settings.allow_anonymous = true;
   acl = [
     "topic write dev2app/#"
     "topic read app2dev/#"
   ];
-  users = { ... unchanged ... };
+
+  users = {
+    "add8a1aB064yb50OdKfV1k" = {
+      password = "GNYVJGGNTO";  # the device's LAN passcode
+      acl = [
+        "readwrite dev2app/add8a1aB064yb50OdKfV1k/#"
+        "readwrite app2dev/add8a1aB064yb50OdKfV1k/#"
+      ];
+    };
+    # ... existing zigbee / homeassistant / telegraf / plug / valetudo
+    # users untouched ...
+  };
 }];
 ```
 

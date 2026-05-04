@@ -1,9 +1,30 @@
 # VaySunic / Gizwits Inverter Notes
 
 Date: 2026-05-03
-Last updated: 2026-05-04
+Last updated: 2026-05-04 (afternoon: hardware verified producing, standard-status hypothesis disproved)
 
 This document records what we have learned so far about the VaySunic mini solar inverter, its Wi-Fi module, and the VaySunic Cloud app. The goal is local data access without using the VaySunic/Gizwits cloud account flow.
+
+## Identified Model
+
+The unit is a `VM800WE-P2` (800 W single-unit Balkonkraftwerk micro-inverter, WiFi variant; P2 generation).
+
+Key spec values from the official German installation manual:
+
+```text
+Operating DC range:   20-60 V
+MPPT range:           33-48 V
+Max input voltage:    63 V DC
+Max input current:    2 x 15 A (two MPPT inputs)
+Output:               230/240 V AC, 50 Hz
+Default power factor: >0.99
+Peak efficiency:      96.8%
+Enclosure:            IP67
+```
+
+The comms module is powered from the DC (PV) input. The manual instructs to wait one minute after connecting DC for the comms module to activate.
+
+Manual: `https://res.vaysunic.com/docs/DE/Installationsanleitung/VM-P2%20Serie_VaySunic_Schnellinstallationsanleitung_DE_V3.0.pdf`
 
 ## Hardware Observations
 
@@ -432,56 +453,38 @@ non-zero byte offsets. It intentionally does not decode the returned status
 payload yet, because live responses showed that the device does not return a
 compact list of only the requested datapoints.
 
-Live standard-status behavior observed so far:
+Live standard-status behavior:
 
 ```text
 Status code byte:       13
 Echoed mask:            matches the requested mask
 Data bytes after mask:  206 bytes
-Focused mask payload:   all zeroes while idle
-All-mask payload:       only offsets +9 and +10 non-zero while idle
-Non-zero bytes:         +9 = 0x23, +10 = 0x28
+Focused mask payload:   all zeroes (always)
+All-mask payload:       only offsets +9 and +10 non-zero (always)
+Non-zero bytes:         +9 = 0x23, +10 = 0x28 (= 0x2328 = 9000)
 ```
 
-The two non-zero bytes are a useful clue:
+The earlier hypothesis was that this is a native product-order payload, with
+writables at the start (the +9/+10 bytes matching `VMCx008` power-factor raw
+9000 → 0.00) and read-only sensor fields after them. **That hypothesis was
+disproved on 2026-05-04**: the payload is byte-identical whether the inverter
+is in standby (red status LED) or producing power normally (green status LED,
+grid-synced, panels delivering 38 V each). On a confirmed-producing unit there
+is no plausible scenario in which grid voltage, grid frequency, current power,
+PV1 voltage/current/power, lifetime generation, or running status are all
+literally zero. So bytes `+9/+10` are not "default power factor" - they are
+just a constant the device emits in this payload, and the rest of the 206 bytes
+is dead space (or meaningful in some way unrelated to live sensor values).
 
-```text
-0x2328 = 9000
-VMCx008 power factor = raw * 0.01 - 90
-9000 * 0.01 - 90 = 0.00
-```
+A separate targeted probe earlier had shown that when requesting only mask bit
+index `6`, the response also contained non-zero bytes at `+0/+1` (`23 28`) -
+the same `0x2328` value. That looked like circumstantial support for the
+product-order hypothesis at the time, but in light of the disproof above it
+just confirms that the device echoes the same constant near the front of the
+payload when small masks are requested.
 
-That is a plausible default power-factor value, so bytes `+9/+10` in the
-206-byte status payload are likely the raw `VMCx008` field.
-
-A follow-up targeted probe strengthened this interpretation. When requesting
-only mask bit/index `6`, the response contained:
-
-```text
-Requested mask:  00 00 00 00 00 00 40
-Echoed mask:     00 00 00 00 00 00 40
-Non-zero bytes:  +0 = 0x23, +1 = 0x28, +9 = 0x23, +10 = 0x28
-```
-
-This suggests the standard-status bitmask is not keyed directly by the visible
-datapoint `id` values from the React Native `autoFeatureList`. It appears to be
-keyed by the native SDK's product-order index. In a plausible compact layout
-that starts with writable/config fields, the offsets line up exactly:
-
-```text
-+0  VMCx001/VMCx002 bool bits, packed into one byte
-+1  VMCx004 grid standard, uint16
-+3  VMCx005 power limit percent, uint16
-+5  VMCx006 absolute power limit, uint16
-+7  VMCx007 current power increment, uint16
-+9  VMCx008 power factor, uint16 raw 9000 -> 0.00
-```
-
-The exact response shape still needs care: the device returns 206 bytes after
-the mask even for single-bit reads, and a selected field can appear at the front
-of the returned data while the same value also appears at its likely full-layout
-offset. The safe current conclusion is that the payload is native product-order
-data, not simple datapoint-ID order.
+The bottom line is that the standard-status `0x90`/`0x93` LAN read does not
+carry sensor data on this device, regardless of which mask is sent.
 
 The visible `VM_WIFI` datapoints that are most useful for the first read-only
 reader are:
@@ -514,6 +517,82 @@ Extra frames seen immediately after login:
 ```
 
 Meaning of `00 62` is not decoded yet.
+
+## Captured-Traffic Confirmation
+
+`vaysunic-app/vaysunic-lan.pcap` (gitignored, ~3 MB) contains TCP/UDP traffic
+between phone (`.78`) and inverter (`.79`) over a long period covering many
+probe sessions. Tally of unique LAN frame commands seen across the entire
+capture:
+
+```text
+TX 0006 (16x)  RX 0007 (16x)   get passcode
+TX 0008 (16x)  RX 0009 (32x)   verify passcode (sometimes acked twice)
+TX 0015 (14x)  RX 0016 (14x)   heartbeat
+TX 0090 (176x) RX 0091 (165x)  status query / response
+TX 0093 (25x)  RX 0094 (24x)   status query with internal SN
+               RX 0062 (16x)   mystery ack after verify
+```
+
+That is the complete set. No subscribe, no notify/push, no other read variant.
+The phone does not use a LAN command we have missed.
+
+UDP `255.255.255.255:2415` carries the inverter's outbound LAN beacon (cmd
+`00 05`). Each beacon contains the same DID, MAC, module version, product key,
+and `api.gizwits.com:80` cloud endpoint as the discovery response. Useful for
+passive presence detection only; no telemetry.
+
+Native daemon strings additionally distinguish "standard protocol" vs "variety
+protocol" products. VaySunic VM_WIFI is "standard". The dispatcher is
+`processP0DataPayload`. Action bytes follow Gizwits convention:
+
+```text
+0x02 / 0x03   read all (no mask) / response
+0x12 / 0x13   read with bitmask / response
+0x04          status report (push from device)
+```
+
+We have never seen the device emit an unsolicited `0x04` push frame.
+
+## Status LED
+
+The inverter has a single bicolor LED that combines Wi-Fi-module signaling
+with inverter run state.
+
+Observed states (2026-05-04):
+
+```text
+Red flashing       inverter not generating - transient at startup, before
+                   grid sync, or while in protection delay
+Green slow flash   inverter operating normally + Wi-Fi connected to LAN +
+                   cloud unreachable (expected when internet is blocked at
+                   the FRITZ!Box)
+Green solid        connected to LAN AND cloud (expected before blocking)
+Green fast flash   SoftAP / Wi-Fi pairing config mode (only during setup)
+```
+
+The "fast flash (1 s 4 times)" / "slow flash (1 s 1 time)" descriptions come
+directly from the bundled `COMMON_TEXT_3` / `COMMON_TEXT_6` strings inside the
+React Native bundle (Wi-Fi pairing wizard). The red/green color split for run
+state matches general inverter convention and was confirmed on this unit by
+watching the LED transition red -> green when grid sync completed.
+
+The slow green flash is the cloudless steady-state we want.
+
+## Cloudless Production - Confirmed
+
+Multiple independent German retail listings for the VM800WE-P2 explicitly
+state that the inverter produces power independently of the app or cloud
+connection - the app is monitoring-only:
+
+> "Der Wechselrichter produziert Strom unabhaengig davon, ob die App oder
+>  Cloud-Verbindung aktiv ist. Die App dient also hauptsaechlich zur
+>  Ueberwachung und nicht als Voraussetzung fuer die Stromproduktion."
+
+This was further validated on 2026-05-04: with internet blocked at the
+FRITZ!Box, panels delivering 38 V each, mains live, the inverter completed
+grid sync (LED red -> green) and entered its normal operating state. So the
+"the inverter needs to bind to the cloud once" theory is unlikely.
 
 ## SoftAP Provisioning
 
@@ -797,35 +876,63 @@ Do not use the guest Wi-Fi for this investigation, because guest Wi-Fi usually b
 
 Prefer a 2.4 GHz SSID. The app/SDK explicitly warns about 5 GHz during onboarding, and many Gizwits Wi-Fi modules are 2.4 GHz only.
 
-## Remaining Unknowns
+## Where We Are
 
-The main read-only LAN path is now understood: UDP `12414` discovery, TCP
-`12416` login, then binary P0 standard-status reads.
+The LAN control path is fully understood: UDP `12414` discovery, TCP `12416`
+login (`00 06` -> `00 07` -> `00 08` -> `00 09`), heartbeat (`00 15` -> `00 16`),
+and standard-status reads (`00 90 12 <mask>` -> `00 91 13 <mask> <206 bytes>`).
 
-Known unknowns:
+The sensor-read path is **not** the standard-status reads. Those reads return
+the same constant payload regardless of inverter run state. There is no other
+LAN command in the captured traffic.
+
+That leaves three possible homes for sensor data:
+
+1. **Cloud only.** Device pushes telemetry to `api.gizwits.com` via HTTP /
+   WebSocket; app reads from cloud cache. LAN port 12416 is just for
+   control/management. Most likely, given the captured-traffic evidence.
+2. **Subscribe-gated.** A subscribe/bind step we have not performed unlocks
+   either `0x04` push frames or a different read variant. The Java SDK has
+   `GizWifiSDKSubscribeDevice`, but it is not visible as a LAN command in the
+   pcap.
+3. **An unidentified LAN command.** Possible but unlikely - the pcap shows
+   the app uses only the same five commands we know.
+
+## Decisive Next Test
+
+Do a one-time bind via the official app, then immediately re-run the probe
+while bound:
+
+1. Temporarily allow the inverter's internet at the FRITZ!Box.
+2. Install `com.vaysunic.app`, register an account, scan QR, accept binding.
+3. While the app is showing live values, run `./probe-vaysunic-lan.sh` again.
+4. Observe whether the LAN payload now contains non-zero sensor bytes.
+5. Re-block internet afterwards.
+
+Outcomes:
 
 ```text
-How product secret is applied to LAN subscribe/control
-Whether JSON datapoint responses are available locally, or only binary P0 packets
-Whether the inverter requires cloud-derived DID/binding state before local reads
-Meaning of LAN command 00 62
-Exact subscribe/update-push behavior after login
-Exact native product-order field list, hidden fields, padding, and full datatype map
+LAN payload now populated  -> theory (2). Replicate whatever the bind sets,
+                              keep cloud blocked, win.
+LAN payload still all zero -> theory (1). Sensor data is cloud-only. Path
+                              forward is to mimic the cloud endpoint locally
+                              (DNS-redirect api.gizwits.com / euapi.gizwits.com /
+                              app.vaysunic.com to a small local server) and
+                              capture the device's telemetry uploads.
 ```
 
-Likely next investigations:
+## Other Open Items
 
 ```text
-1. Extract the full hidden product/datapoint layout from the native SDK inputs.
-2. Capture status while the inverter is producing non-zero PV/grid values.
-3. Decode the fixed 206-byte payload against the VM_WIFI product config.
-4. Rename/fix the probe's status-mask language once the product-order mapping is confirmed.
-5. Reverse engineer writable/control commands only after read-only access is stable.
-6. Turn the probe into a small local reader.
-7. Keep the inverter internet-blocked in the FRITZ!Box.
+Meaning of LAN command 00 62 (mystery ack after verify)
+Whether the device speaks any datapoint protocol over the cloud HTTP/WS path
+  that we could intercept locally via DNS redirect
+Whether the captured-traffic finding ("only five LAN commands ever") generalises
+  beyond our own probe runs - the pcap is mostly our own probe sessions
 ```
 
-Potential capture command after the inverter is on LAN:
+Capture command for future PCAPs (the existing `vaysunic-app/vaysunic-lan.pcap`
+was made similarly):
 
 ```bash
 sudo nix-shell -p tcpdump --run 'tcpdump -i any -n -s0 -w /tmp/vaysunic-lan.pcap host <INVERTER_IP> or udp port 2415 or udp port 12414 or tcp port 12416'
@@ -844,4 +951,10 @@ AVM FRITZ!Box internet blocking docs:
 
 ```text
 https://fritz.com/en/apps/knowledge-base/FRITZ-Box-7490/8_8_Restricting-internet-use-with-the-FRITZ-Box-parental-controls
+```
+
+Official VaySunic VM-P2 series German installation manual:
+
+```text
+https://res.vaysunic.com/docs/DE/Installationsanleitung/VM-P2%20Serie_VaySunic_Schnellinstallationsanleitung_DE_V3.0.pdf
 ```
